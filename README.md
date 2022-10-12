@@ -10,7 +10,7 @@ Install on your OS:
 * `cmake`
 
 ```
-$ git clone https://github.com/vtrebicky/visca2uvc.git
+$ git clone --recursive https://github.com/vtrebicky/visca2uvc.git
 $ cd visca2uvc
 $ mkdir build
 $ cd build
