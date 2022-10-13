@@ -12,28 +12,10 @@
 
 namespace {
 
-template <typename T, void (*deleter)(T*)>
-class UvcWrapper {
- protected:
-  explicit UvcWrapper(T* value) : value_(value) {}
-  ~UvcWrapper() {
-    if (value_ != nullptr) deleter(value_);
+#define RETURN_IF_UVC_ERROR(expr)                                             \
+  if (const uvc_error err = (expr); err < 0) {                                \
+    return absl::InternalError(absl::StrCat(#expr, ": ", uvc_strerror(err))); \
   }
-  UvcWrapper(const UvcWrapper&) = delete;
-  UvcWrapper& operator=(const UvcWrapper&) = delete;
-  UvcWrapper(UvcWrapper&& other) : value_(other.value_) {
-    other.value_ = nullptr;
-  }
-  UvcWrapper& operator=(UvcWrapper&& other) {
-    std::swap(other.value_, value_);
-    return *this;
-  }
-
-  T* value() const { return value_; }
-
- private:
-  T* value_;
-};
 
 struct ZoomRel {
   int8_t zoom_rel;
@@ -48,93 +30,86 @@ struct ZoomRel {
   }
 };
 
-class UvcDeviceHandle : public UvcWrapper<uvc_device_handle_t, &uvc_close> {
+class UvcDelete {
  public:
+  void operator()(uvc_device_handle_t* ptr) noexcept { uvc_close(ptr); }
+  void operator()(uvc_device_t* ptr) noexcept { uvc_unref_device(ptr); }
+  void operator()(uvc_context_t* ptr) noexcept { uvc_exit(ptr); }
+};
+
+template <typename T>
+using UvcUniquePtr = std::unique_ptr<T, UvcDelete>;
+
+class UvcDeviceHandle {
+ public:
+  using Ptr = UvcUniquePtr<uvc_device_handle_t>;
+  explicit UvcDeviceHandle(Ptr handle) : handle_(std::move(handle)) {}
+
   absl::StatusOr<uint16_t> GetZoomAbs(uvc_req_code req_code) const {
     uint16_t result;
-    if (const uvc_error_t err = uvc_get_zoom_abs(value(), &result, req_code);
-        err < 0) {
-      return absl::InternalError(
-          absl::StrCat("uvc_get_zoom_abs: ", uvc_strerror(err)));
-    }
+    RETURN_IF_UVC_ERROR(uvc_get_zoom_abs(handle_.get(), &result, req_code));
     return result;
   }
 
   absl::Status SetZoomAbs(uint16_t focal_length) {
-    if (const uvc_error_t err = uvc_set_zoom_abs(value(), focal_length);
-        err < 0) {
-      return absl::InternalError(
-          absl::StrCat("uvc_set_zoom_abs: ", uvc_strerror(err)));
-    }
+    RETURN_IF_UVC_ERROR(uvc_set_zoom_abs(handle_.get(), focal_length));
     return absl::OkStatus();
   }
 
   absl::StatusOr<ZoomRel> GetZoomRel(uvc_req_code req_code) const {
     ZoomRel result;
-    if (const uvc_error_t err =
-            uvc_get_zoom_rel(value(), &result.zoom_rel, &result.digital_zoom,
-                             &result.speed, req_code);
-        err < 0) {
-      return absl::InternalError(
-          absl::StrCat("uvc_get_zoom_rel: ", uvc_strerror(err)));
-    }
+    RETURN_IF_UVC_ERROR(uvc_get_zoom_rel(handle_.get(), &result.zoom_rel,
+                                         &result.digital_zoom, &result.speed,
+                                         req_code));
     return result;
   }
 
   absl::Status SetZoomRel(const ZoomRel& zoom) {
-    if (const uvc_error_t err = uvc_set_zoom_rel(value(), zoom.zoom_rel,
-                                                 zoom.digital_zoom, zoom.speed);
-        err < 0) {
-      return absl::InternalError(
-          absl::StrCat("uvc_set_zoom_rel: ", uvc_strerror(err)));
-    }
+    RETURN_IF_UVC_ERROR(uvc_set_zoom_rel(handle_.get(), zoom.zoom_rel,
+                                         zoom.digital_zoom, zoom.speed));
     return absl::OkStatus();
   }
 
-  void PrintDiag(FILE* file) const { uvc_print_diag(value(), file); }
+  void PrintDiag(FILE* file) const { uvc_print_diag(handle_.get(), file); }
 
  private:
-  explicit UvcDeviceHandle(uvc_device_handle_t* handle) : UvcWrapper(handle) {}
-  friend class UvcDevice;
+  Ptr handle_;
 };
 
-class UvcDevice : public UvcWrapper<uvc_device_t, &uvc_unref_device> {
+class UvcDevice {
  public:
+  using Ptr = UvcUniquePtr<uvc_device_t>;
+  explicit UvcDevice(Ptr dev) : dev_(std::move(dev)) {}
+
   absl::StatusOr<UvcDeviceHandle> Open() {
     uvc_device_handle_t* handle;
-    if (const uvc_error_t err = uvc_open(value(), &handle); err < 0) {
-      return absl::InternalError(absl::StrCat("uvc_open: ", uvc_strerror(err)));
-    }
-    return UvcDeviceHandle(handle);
+    RETURN_IF_UVC_ERROR(uvc_open(dev_.get(), &handle));
+    return UvcDeviceHandle(UvcDeviceHandle::Ptr(handle));
   }
 
  private:
-  explicit UvcDevice(uvc_device_t* dev) : UvcWrapper(dev) {}
-  friend class UvcContext;
+  Ptr dev_;
 };
 
-class UvcContext : public UvcWrapper<uvc_context_t, &uvc_exit> {
+class UvcContext {
  public:
+  using Ptr = UvcUniquePtr<uvc_context_t>;
+  explicit UvcContext(Ptr ctx) : ctx_(std::move(ctx)) {}
+
   static absl::StatusOr<UvcContext> Create() {
     uvc_context_t* ctx;
-    if (const uvc_error_t err = uvc_init(&ctx, /*usb_ctx=*/nullptr); err < 0) {
-      return absl::InternalError(absl::StrCat("uvc_init: ", uvc_strerror(err)));
-    }
-    return UvcContext(ctx);
+    RETURN_IF_UVC_ERROR(uvc_init(&ctx, /*usb_ctx=*/nullptr));
+    return UvcContext(Ptr(ctx));
   }
 
   absl::StatusOr<UvcDevice> FindDevice(int vid, int pid, const char* sn) {
     uvc_device_t* dev;
-    if (const uvc_error_t err = uvc_find_device(value(), &dev, vid, pid, sn);
-        err < 0) {
-      return absl::InternalError(
-          absl::StrCat("uvc_find_device: ", uvc_strerror(err)));
-    }
-    return UvcDevice(dev);
+    RETURN_IF_UVC_ERROR(uvc_find_device(ctx_.get(), &dev, vid, pid, sn));
+    return UvcDevice(UvcDevice::Ptr(dev));
   }
 
  private:
-  explicit UvcContext(uvc_context_t* ctx) : UvcWrapper(ctx) {}
+  Ptr ctx_;
 };
 
 template <typename T>
