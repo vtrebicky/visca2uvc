@@ -7,6 +7,8 @@ Install on your OS:
 
 * `git`
 * C++ compiler (`gcc`)
+* `pkg-config`
+* `libusb`
 * `cmake`
 
 ```
